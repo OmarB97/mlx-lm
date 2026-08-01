@@ -619,15 +619,24 @@ def sharded_load(
             weight_index = json.load(fid)["weight_map"]
 
         local_files = set()
+        unmatched = 0
         for k, _ in tree_flatten(model.parameters()):
-            if file_name := weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+            file_name = weight_index.get(k)
+            if file_name is None:
+                unmatched += 1
+                continue
+            local_files.add(file_name)
 
-        # Download weights for local shard
-        _download(repo, allow_patterns=local_files)
+        if local_files:
+            # Download weights for local shard (tolerate params absent from
+            # the index — computed buffers and sanitize-renamed keys).
+            _download(repo, allow_patterns=local_files)
+        else:
+            # Zero overlap: a reference-named checkpoint whose keys only map
+            # to the model tree through sanitize() at load time (e.g. raw HF
+            # naming). We can't resolve per-rank files up front, so fetch
+            # everything; lazy loading still materializes only local layers.
+            _download(repo)
     else:
         _download(repo)
 
