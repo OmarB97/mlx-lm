@@ -60,7 +60,14 @@ if __name__ == "__main__":
         if rank == 0:
             print(*args, **kwargs)
 
+    import sys as _sys, time as _time
+
+    def _phase(msg):
+        print(f"[rank {rank}] {_time.strftime('%H:%M:%S')} {msg}", file=_sys.stderr, flush=True)
+
+    _phase("sharded_load: begin")
     model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
+    _phase("sharded_load: done (weights resident, barrier passed)")
 
     messages = [{"role": "user", "content": args.prompt}]
     prompt = tokenizer.apply_chat_template(
@@ -68,6 +75,7 @@ if __name__ == "__main__":
         add_generation_prompt=True,
     )
 
+    _phase("generate: begin")
     for response in stream_generate(
         model, tokenizer, prompt, max_tokens=args.max_tokens
     ):
