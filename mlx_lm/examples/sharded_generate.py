@@ -65,9 +65,19 @@ if __name__ == "__main__":
     def _phase(msg):
         print(f"[rank {rank}] {_time.strftime('%H:%M:%S')} {msg}", file=_sys.stderr, flush=True)
 
+    import os as _os
+    if (_cap := _os.environ.get("MLX_DS4_MEM_LIMIT_GB")):
+        import mlx.core as _mx
+        _mx.set_memory_limit(int(float(_cap) * 2**30))
+        _phase(f"memory limit set to {_cap} GiB")
+
     _phase("sharded_load: begin")
     model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
-    _phase("sharded_load: done (weights resident, barrier passed)")
+    _phase(
+        "sharded_load: done — active "
+        f"{mx.get_active_memory()/2**30:.1f} GiB, peak {mx.get_peak_memory()/2**30:.1f} GiB, "
+        f"cache {mx.get_cache_memory()/2**30:.1f} GiB"
+    )
 
     messages = [{"role": "user", "content": args.prompt}]
     prompt = tokenizer.apply_chat_template(

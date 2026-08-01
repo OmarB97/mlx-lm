@@ -9,6 +9,7 @@
 # Reference: deepseek-ai/DeepSeek-V4 (Apr 2026). mHC: arXiv:2512.24880.
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -1134,7 +1135,28 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
         )
 
     def pipeline(self, group):
-        super().pipeline(group)
+        import os
+        if (split := os.environ.get("MLX_PIPELINE_SPLIT")):
+            # Explicit per-rank layer counts, comma-separated by rank index
+            # (e.g. "24,19": rank 0 takes the LAST 24 layers, rank 1 the
+            # first 19). Ranks own contiguous slices in reverse rank order,
+            # matching the mixin's default layout.
+            sizes_by_rank = [int(x) for x in split.split(",")]
+            if len(sizes_by_rank) != group.size() or sum(sizes_by_rank) != len(self.layers):
+                raise ValueError(
+                    f"MLX_PIPELINE_SPLIT={split!r} does not partition "
+                    f"{len(self.layers)} layers over {group.size()} ranks"
+                )
+            self.pipeline_rank = group.rank()
+            self.pipeline_size = group.size()
+            sizes = list(reversed(sizes_by_rank))  # execution order
+            pos = self.pipeline_size - 1 - self.pipeline_rank
+            self.start_idx = sum(sizes[:pos])
+            self.end_idx = self.start_idx + sizes[pos]
+            self.layers = self.layers[: self.end_idx]
+            self.layers[: self.start_idx] = [None] * self.start_idx
+        else:
+            super().pipeline(group)
         # __call__ iterates via self.num_layers (the LOCAL layer count);
         # keep it in sync with the mixin's slice.
         self.num_layers = self.end_idx - self.start_idx
@@ -1339,6 +1361,11 @@ class Model(nn.Module):
             layers.N.ffn.experts.w{1,2,3}.{weight,biases,scales} (pre-stacked)
         """
         n_layers = self.args.num_hidden_layers
+
+        # Optional: drop MTP entirely (saves the head's weights on every
+        # rank when speculative decoding is not in use).
+        if os.environ.get("MLX_DS4_SKIP_MTP"):
+            weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
 
         # 1) Keep MTP weights only when self.mtp exists; drop layers beyond n_layers
         has_mtp = hasattr(self, "mtp")
