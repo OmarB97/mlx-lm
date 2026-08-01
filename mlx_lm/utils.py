@@ -658,15 +658,18 @@ def sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
-    # Materialize layer-by-layer: a single mega-graph eval builds monolithic
-    # Metal command buffers that can wedge or OOM the GPU during cold
-    # multi-tens-of-GB loads; bounded per-layer commits load reliably.
-    layers = getattr(getattr(model, "model", None), "layers", None)
-    if layers is not None:
-        for layer in layers:
-            if layer is not None:
-                mx.eval(layer.parameters())
-    mx.eval(model.parameters())
+    # Materialize on the CPU stream, layer-by-layer. Unified memory makes
+    # CPU materialization free (no later transfer), and it sidesteps the
+    # Metal command-buffer path entirely — monolithic GPU commits during
+    # cold multi-tens-of-GB loads intermittently wedge forever in
+    # CommandEncoder::commit or die with command-buffer OOM.
+    with mx.stream(mx.cpu):
+        layers = getattr(getattr(model, "model", None), "layers", None)
+        if layers is not None:
+            for layer in layers:
+                if layer is not None:
+                    mx.eval(layer.parameters())
+        mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
