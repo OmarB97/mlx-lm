@@ -1470,6 +1470,93 @@ class TestModels(unittest.TestCase):
         ).reshape(1, 2, 4, 8)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
+
+    def test_pipeline_mixin_partition_exact(self):
+        """The reverse pipeline split must cover every layer exactly once for
+        any (n_layers, pipeline_size) — the uniform layers-per-rank arithmetic
+        used to skip a layer on uneven splits (e.g. 43 over 2)."""
+        from mlx_lm.models.pipeline import PipelineMixin
+
+        class FakeGroup:
+            def __init__(self, rank, size):
+                self._rank, self._size = rank, size
+
+            def rank(self):
+                return self._rank
+
+            def size(self):
+                return self._size
+
+        class Layers(PipelineMixin):
+            def __init__(self, n):
+                super().__init__()
+                self.layers = list(range(n))
+
+        for n in (4, 43, 61, 7):
+            for size in (1, 2, 3, 4):
+                covered = []
+                for rank in range(size):
+                    m = Layers(n)
+                    m.pipeline(FakeGroup(rank, size))
+                    local = m.layers[m.start_idx : m.end_idx]
+                    self.assertTrue(all(l is not None for l in local))
+                    self.assertTrue(
+                        all(l is None for l in m.layers[: m.start_idx])
+                    )
+                    # rank 0 must own the LAST layers (it holds the heads)
+                    if rank == 0:
+                        self.assertEqual(m.end_idx, n)
+                    covered.extend(local)
+                self.assertEqual(sorted(covered), list(range(n)), (n, size))
+
+    def test_deepseek_v4_pipeline_num_layers_sync(self):
+        """DeepseekV4Model.pipeline must retighten num_layers to the local
+        slice — __call__ iterates range(num_layers) over start_idx offsets."""
+        from mlx_lm.models import deepseek_v4
+
+        class FakeGroup:
+            def __init__(self, rank, size):
+                self._rank, self._size = rank, size
+
+            def rank(self):
+                return self._rank
+
+            def size(self):
+                return self._size
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=5,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 0, 0, 0, 0],
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+        )
+        total = 0
+        for rank in range(2):
+            model = deepseek_v4.DeepseekV4Model(args)
+            model.pipeline(FakeGroup(rank, 2))
+            self.assertEqual(model.num_layers, model.end_idx - model.start_idx)
+            local = model.layers[model.start_idx : model.end_idx]
+            self.assertEqual(len(local), model.num_layers)
+            total += model.num_layers
+        self.assertEqual(total, 5)
+
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
 

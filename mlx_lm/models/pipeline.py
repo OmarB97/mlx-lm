@@ -20,12 +20,20 @@ class PipelineMixin:
         # rank=pipeline_size-1 gets the first
         self.pipeline_rank = group.rank()
         self.pipeline_size = group.size()
-        layers_per_rank = len(self.layers) // self.pipeline_size
-        extra = len(self.layers) - layers_per_rank * self.pipeline_size
-        if self.pipeline_rank < extra:
-            layers_per_rank += 1
-        self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
-        self.end_idx = self.start_idx + layers_per_rank
+        n = len(self.layers)
+        base = n // self.pipeline_size
+        extra = n % self.pipeline_size
+        # Execution order runs from rank size-1 (first layers) down to rank 0
+        # (last layers). Hand the remainder to the earliest execution
+        # positions so rank 0 — which also holds the output head(s) — gets
+        # the smallest share. Computing explicit per-position sizes keeps the
+        # partition exact for any n/size (the previous uniform
+        # layers-per-rank arithmetic skipped a layer on uneven splits, e.g.
+        # 43 layers over 2 ranks left layer 21 unassigned).
+        sizes = [base + (1 if i < extra else 0) for i in range(self.pipeline_size)]
+        pos = self.pipeline_size - 1 - self.pipeline_rank  # execution position
+        self.start_idx = sum(sizes[:pos])
+        self.end_idx = self.start_idx + sizes[pos]
         self.layers = self.layers[: self.end_idx]
         # Keep the layer numbers the same for model loading
         self.layers[: self.start_idx] = [None] * self.start_idx

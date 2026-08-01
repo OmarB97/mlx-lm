@@ -1133,6 +1133,12 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
             args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
         )
 
+    def pipeline(self, group):
+        super().pipeline(group)
+        # __call__ iterates via self.num_layers (the LOCAL layer count);
+        # keep it in sync with the mixin's slice.
+        self.num_layers = self.end_idx - self.start_idx
+
     def __call__(self, inputs: mx.array, cache=None, return_raw_hidden: bool = False):
         h = self.embed_tokens(inputs)                        # [B, S, D]
         # Expand to hc_mult parallel copies
