@@ -658,6 +658,14 @@ def sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
+    # Materialize layer-by-layer: a single mega-graph eval builds monolithic
+    # Metal command buffers that can wedge or OOM the GPU during cold
+    # multi-tens-of-GB loads; bounded per-layer commits load reliably.
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is not None:
+        for layer in layers:
+            if layer is not None:
+                mx.eval(layer.parameters())
     mx.eval(model.parameters())
 
     # Synchronize processes to avoid timeout
