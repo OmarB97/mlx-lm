@@ -411,6 +411,13 @@ def load_model(
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
+            # Reference-named checkpoints keep per-module quantization keys
+            # in their original (pre-sanitize) spelling; ask the model for
+            # the aliases of this path before falling back.
+            if (aliases := getattr(model, "quant_config_key_aliases", None)) is not None:
+                for alias in aliases(p):
+                    if alias in config["quantization"]:
+                        return config["quantization"][alias]
             if not hasattr(m, "to_quantized"):
                 return False
             return f"{p}.scales" in weights

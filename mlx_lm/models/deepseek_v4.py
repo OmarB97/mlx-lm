@@ -1283,6 +1283,37 @@ class Model(nn.Module):
     # Weight loading                                                      #
     # ------------------------------------------------------------------- #
 
+    def quant_config_key_aliases(self, path: str) -> List[str]:
+        """Pre-sanitize spellings of a module path, for quantization-config
+        lookup. Reference-named checkpoints (raw HF layout, e.g. the MXFP4
+        MLX conversions) keep their per-module quantization dict in the
+        original naming; sanitize() renames the weights but the config keys
+        stay as-shipped, so the loader needs the reverse mapping."""
+        aliases = []
+        p = path
+        if p.startswith("model."):
+            p = p[len("model."):]
+            aliases.append(p)
+        if path.startswith("lm_head"):
+            aliases.append("head" + path[len("lm_head"):])
+        if path.startswith("model.embed_tokens"):
+            aliases.append("embed" + path[len("model.embed_tokens"):])
+        # mtp.N.block.X -> mtp.N.X
+        if p.startswith("mtp."):
+            parts = p.split(".", 3)
+            if len(parts) == 4 and parts[2] == "block":
+                p = f"{parts[0]}.{parts[1]}.{parts[3]}"
+                aliases.append(p)
+        # switch_mlp.{gate,down,up}_proj -> experts.w{1,2,3};
+        # shared_experts.{gate,down,up}_proj -> shared_experts.w{1,2,3}
+        rev = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+        for proj, w in rev.items():
+            if f".switch_mlp.{proj}" in p:
+                aliases.append(p.replace(f".switch_mlp.{proj}", f".experts.{w}"))
+            if f".shared_experts.{proj}" in p:
+                aliases.append(p.replace(f".shared_experts.{proj}", f".shared_experts.{w}"))
+        return aliases
+
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Handle DeepSeek-V4 checkpoint conversion.
 
@@ -1473,12 +1504,17 @@ class Model(nn.Module):
         for l in range(n_layers):
             prefix = f"model.layers.{l}.ffn.experts"
             for src, dst in expert_remap.items():
-                # Case A: per-expert weights need stacking (raw HF checkpoint)
-                key0 = f"{prefix}.0.{src}.weight"
-                if key0 in weights:
-                    stack = [weights.pop(f"{prefix}.{e}.{src}.weight")
-                             for e in range(self.args.n_routed_experts)]
-                    weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.weight"] = mx.stack(stack)
+                # Case A: per-expert weights need stacking. Raw HF checkpoints
+                # carry only .weight (block scales were dequantized in step 2);
+                # MLX-quantized per-expert checkpoints (e.g. MXFP4 conversions)
+                # also carry .scales/.biases — stack every component present or
+                # the module can never be quantize-wrapped at load.
+                for suffix in ("weight", "scales", "biases"):
+                    key0 = f"{prefix}.0.{src}.{suffix}"
+                    if key0 in weights:
+                        stack = [weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                                 for e in range(self.args.n_routed_experts)]
+                        weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.{suffix}"] = mx.stack(stack)
                 # Case B: already-stacked (community quant) — rename experts.w1.X -> switch_mlp.gate_proj.X
                 for suffix in ("weight", "biases", "scales"):
                     old = f"{prefix}.{src}.{suffix}"
@@ -1509,15 +1545,16 @@ class Model(nn.Module):
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),
                 ):
-                    key0 = f"{prefix}.0.{src}.weight"
-                    if key0 in weights:
-                        stacked = [
-                            weights.pop(f"{prefix}.{e}.{src}.weight")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[
-                            f"mtp.{mtp_idx}.block.ffn.switch_mlp.{dst}.weight"
-                        ] = mx.stack(stacked)
+                    for suffix in ("weight", "scales", "biases"):
+                        key0 = f"{prefix}.0.{src}.{suffix}"
+                        if key0 in weights:
+                            stacked = [
+                                weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                                for e in range(self.args.n_routed_experts)
+                            ]
+                            weights[
+                                f"mtp.{mtp_idx}.block.ffn.switch_mlp.{dst}.{suffix}"
+                            ] = mx.stack(stacked)
 
         return weights
 
