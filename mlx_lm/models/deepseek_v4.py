@@ -240,6 +240,21 @@ class DeepseekV4RoPE(nn.Module):
     def inv_freq(self):
         return self._inv_freq[0]
 
+    def apply_positions(self, x: mx.array, positions: mx.array) -> mx.array:
+        """Rotate x (last dim == self.dims) at explicit — possibly
+        non-contiguous — absolute positions along axis -2. Compressed-KV rows
+        are born at window-start positions (0, ratio, 2*ratio, ...), matching
+        the reference's rope.apply_positions on pooled entries."""
+        dtype = x.dtype
+        theta = positions.astype(mx.float32)[:, None] * self.inv_freq[None, :]
+        shape = (1,) * (x.ndim - 2) + theta.shape
+        cos = mx.cos(theta).reshape(shape).astype(dtype)
+        sin = mx.sin(theta).reshape(shape).astype(dtype)
+        rot = x.reshape(*x.shape[:-1], self.dims // 2, 2)
+        x0, x1 = rot[..., 0], rot[..., 1]
+        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
+        return y.reshape(*x.shape)
+
     def __call__(self, x: mx.array, offset: int = 0, inverse: bool = False):
         dtype = x.dtype
         T = x.shape[-2]
@@ -447,6 +462,21 @@ class DeepseekV4MoE(nn.Module):
 # Attention: MLA (num_kv_heads=1) + sliding window + optional compressed KV   #
 # --------------------------------------------------------------------------- #
 
+def _rope_compressed_rows(rows: mx.array, first_window_start: int,
+                          ratio: int, rope, rd: int) -> mx.array:
+    """Rope the trailing `rd` dims of freshly pooled compressed-KV rows at
+    their absolute window-start positions. The reference implementation
+    stores compressed entries pre-rotated with the compress rope
+    (compress_rope_theta); un-roped entries scored against roped queries
+    corrupt every compressed-attention layer."""
+    n = rows.shape[-2]
+    if n == 0 or rope is None:
+        return rows
+    pos = first_window_start + mx.arange(n, dtype=mx.float32) * ratio
+    head, tail = rows[..., :-rd], rows[..., -rd:]
+    return mx.concatenate([head, rope.apply_positions(tail, pos)], axis=-1)
+
+
 class CompressedKVCache(KVCache):
     """Cache for compressed-attention layers: sliding-window local cache + compressed KV pool.
 
@@ -639,7 +669,7 @@ class CompressedKVCache(KVCache):
             return self.local.batch_size
         return 1
 
-    def accumulate(self, x: mx.array, compressor: 'Compressor') -> Optional[mx.array]:
+    def accumulate(self, x: mx.array, compressor: 'Compressor', rope=None) -> Optional[mx.array]:
         """Buffer tokens and compress when a full window is ready.
 
         Uses ds4-style rolling state: each token is immediately projected through
@@ -663,6 +693,10 @@ class CompressedKVCache(KVCache):
         if S > 1:
             ckv = compressor(x)
             if ckv.shape[1] > 0:
+                n_before = 0 if self._pool is None else self._pool.shape[1]
+                ckv = _rope_compressed_rows(
+                    ckv, n_before * r, r, rope, compressor.rope_head_dim
+                )
                 self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
             remainder = S % r
             if remainder > 0:
@@ -701,6 +735,11 @@ class CompressedKVCache(KVCache):
             pooled = (self._state_kv * weights).sum(axis=1, keepdims=True)
             pooled = pooled[:, :, :compressor.head_dim]
             ckv = compressor.norm(pooled.astype(x.dtype))
+            # Rope the newborn row at its window start (pos + 1 - r), matching
+            # the reference decode path.
+            ckv = _rope_compressed_rows(
+                ckv, pos + 1 - r, r, rope, compressor.rope_head_dim
+            )
             self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
             self._state_kv = None
             self._state_score = None
@@ -814,16 +853,22 @@ class V4Attention(nn.Module):
         self.wo_a = nn.Linear(group_feat, self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=args.attention_bias)
 
-        # RoPE: main Q/K always rotate with rope_theta. Compressed-pool RoPE
-        # (when present) uses compress_rope_theta. Reference DeepSeek-V4
-        # initializes both as separate instances — sharing them ties the main
-        # attention rotation to the wrong base on compressed layers, manifesting
-        # as periodic token drops in CJK (cf. Shinka-Man's report on #1192,
-        # fixed there in @Blaizzy/mlx-lm@b78ccb1).
-        self.rope = DeepseekV4RoPE(self.rope_head_dim, args.rope_theta, args.rope_scaling)
-        self.compress_rope = DeepseekV4RoPE(
-            self.rope_head_dim, args.compress_rope_theta, args.rope_scaling,
-        )
+        # RoPE regime is PER LAYER KIND (reference Attention.__init__):
+        #   sparse layers (compress_ratio > 0): theta = compress_rope_theta
+        #     (160000) WITH YaRN — and the same instance rotates q, k, the
+        #     o-derotation, and the compressed-pool rows.
+        #   dense layers: theta = rope_theta (10000), YaRN DISABLED.
+        # The previous two-instance scheme roped every layer's main q/k at
+        # rope_theta+YaRN — the wrong base on all ~40 sparse layers (the
+        # compounding divergence behind degenerate output; also the likely
+        # true cause of the CJK token-drop reports on #1192).
+        if self.compress_ratio:
+            self.rope = DeepseekV4RoPE(
+                self.rope_head_dim, args.compress_rope_theta, args.rope_scaling
+            )
+        else:
+            self.rope = DeepseekV4RoPE(self.rope_head_dim, args.rope_theta, None)
+        self.compress_rope = self.rope
 
         # Compressor / Indexer — present only when compress_ratio > 0
         if self.compress_ratio:
@@ -905,10 +950,16 @@ class V4Attention(nn.Module):
         if self.compress_ratio:
             comp_cache = cache if isinstance(cache, CompressedKVCache) else None
             if comp_cache is not None:
-                pool = comp_cache.accumulate(x, self.compressor)
+                pool = comp_cache.accumulate(x, self.compressor, self.compress_rope)
             elif S > 1:
                 pool = self.compressor(x)
-                pool = pool if pool.shape[1] > 0 else None
+                if pool.shape[1] > 0:
+                    pool = _rope_compressed_rows(
+                        pool, 0, self.compress_ratio, self.compress_rope,
+                        self.compressor.rope_head_dim,
+                    )
+                else:
+                    pool = None
             else:
                 pool = None
 
@@ -937,7 +988,39 @@ class V4Attention(nn.Module):
             if mask is not None:
                 comp_shape = list(mask.shape)
                 comp_shape[-1] = n_comp
-                comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
+                is_bool = mask.dtype == mx.bool_
+                if S > 1:
+                    # Causal visibility (reference get_compress_topk_idxs):
+                    # the query at absolute position p may attend compressed
+                    # row j only when the row's window is fully in the past —
+                    # j < (p + 1) // ratio. MUST honor the incoming mask's
+                    # convention: create_attention_mask returns a BOOLEAN
+                    # keep-mask here — a zeros/-inf float block coerced into
+                    # bool inverts or erases compressed visibility entirely.
+                    q_pos = offset + mx.arange(S, dtype=mx.int32)
+                    row_lim = (q_pos + 1) // self.compress_ratio
+                    rows = mx.arange(n_comp, dtype=mx.int32)
+                    visible = rows[None, :] < row_lim[:, None]
+                    if is_bool:
+                        causal = visible
+                    else:
+                        causal = mx.where(
+                            visible,
+                            mx.array(0.0, dtype=mask.dtype),
+                            mx.array(-float("inf"), dtype=mask.dtype),
+                        )
+                    comp_mask = mx.broadcast_to(
+                        causal.reshape(
+                            (1,) * (len(comp_shape) - 2) + (S, n_comp)
+                        ),
+                        comp_shape,
+                    )
+                else:
+                    # Decode: every pooled row is fully in the past (visible).
+                    if is_bool:
+                        comp_mask = mx.ones(comp_shape, dtype=mx.bool_)
+                    else:
+                        comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
                 mask = mx.concatenate([comp_mask, mask], axis=-1)
 
         out = scaled_dot_product_attention(
